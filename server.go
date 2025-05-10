@@ -13,13 +13,16 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const kMagicNum = 0x3bef5c
 
 type Option struct {
-	MagicNum    int          // MagicNumber marks this's a geerpc request
-	CodecFormat codec.Format // client may choose different Codec to encode body
+	MagicNum       int           // MagicNumber marks this's a geerpc request
+	CodecFormat    codec.Format  // client may choose different Codec to encode body
+	ConnectTimeout time.Duration // 0 means no limit
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
@@ -97,7 +100,7 @@ func (s *Server) Accept(lis net.Listener) {
 func (s *Server) ServeConn(conn net.Conn) {
 	defer conn.Close()
 
-	// 反序列化Option（只需要在第一次通讯时发送自己的魔数和编码格式）
+	// 读取Option（客户端只需要在第一次通讯时发送自己的魔数和编码格式，因此服务端也只需要读取1次）
 	var opt Option
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
 		log.Println("rpc server: options error: ", err)
@@ -110,14 +113,14 @@ func (s *Server) ServeConn(conn net.Conn) {
 	}
 
 	codecFn := codec.NewCodecFuncMap[opt.CodecFormat]
-	s.serveCodec(codecFn(conn))
+	s.serveCodec(codecFn(conn), &opt)
 }
 
 // invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
 // serveCodec 解码多个Header+Body对
-func (s *Server) serveCodec(cc codec.Codec) {
+func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex) // 为了保证请求的有序发送
 	wg := new(sync.WaitGroup)  // wait until all request are handled
 	// 可能有多个Header+Body对
@@ -135,7 +138,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 		}
 		wg.Add(1)
 		// 并发执行请求（需要保证请求执行完后响应的发送是顺序的，所以用sending锁来保证顺序）
-		go s.handleRequest(cc, req, sending, wg)
+		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	cc.Close()
@@ -178,14 +181,35 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 }
 
 // handleRequest 处理请求
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	if err := req.svc.call(req.mtype, req.argv, req.replyv); err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(cc, req.h, invalidRequest, sending)
+	// 使用非阻塞chan，防止超时以后，无缓存chan sent和called没有办法发送，协程被阻塞了退出不了导致的协程泄漏
+	called := make(chan struct{}, 1)
+	sent := make(chan struct{}, 1)
+	go func() {
+		defer func() { sent <- struct{}{} }()
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			return
+		}
+		s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	// timeout是执行本地方法+发送响应的总时间
+	select {
+	case <-called: // 服务端本地方法执行完成
+		<-sent // 发送响应完成
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	}
 }
 
 // sendResponse 发送响应
