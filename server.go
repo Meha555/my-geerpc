@@ -2,13 +2,17 @@ package geerpc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"geerpc/codec"
+	"go/ast"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const kMagicNum = 0x3bef5c
@@ -30,16 +34,50 @@ var DefaultOption = &Option{
 // 在一次连接中，Option 固定在报文的最开始，Header 和 Body 可以有多个，即报文可能是这样的。
 // | Option | Header1 | Body1 | Header2 | Body2 | ...
 
-// request stores all information of a call
+// request 存储了一次调用的全部信息
 type request struct {
-	h            *codec.Header // header of request
-	argv, replyv reflect.Value // argv and replyv for request
+	h            *codec.Header // 该请求的Header
+	argv, replyv reflect.Value // 该请求的参数和返回值
+	mtype        *methodType   // 该请求想要调用的函数
+	svc          *service      // 反射对应的结构体
 }
 
-type Server struct{}
+// Server represents an RPC Server.
+type Server struct {
+	serviceMap sync.Map
+}
 
 func NewServer() *Server {
 	return &Server{}
+}
+
+func (s *Server) Register(rcvr interface{}) (err error) {
+	svc := newService(rcvr)
+	if _, exists := s.serviceMap.LoadOrStore(svc.name, svc); exists {
+		err = errors.New("rpc server: service already registered: " + svc.name)
+	}
+	return
+}
+
+func (s *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dotPos := strings.LastIndex(serviceMethod, ".")
+	if dotPos < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	svcName, methodName := serviceMethod[:dotPos], serviceMethod[dotPos+1:]
+	svci, ok := s.serviceMap.Load(svcName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + svcName)
+		return
+	}
+	svc = svci.(*service) // interface 在类型断言时需要断言为实现类的指针
+	mtype = svc.methods[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+		return
+	}
+	return
 }
 
 // Accept accepts connections on the listener and serves requests
@@ -109,7 +147,7 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 		var h codec.Header
 		if err := cc.ReadHeader(&h); err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
-				err = fmt.Errorf("rpc: read header error: %w", err)
+				err = fmt.Errorf("rpc server: read header error: %w", err)
 			}
 			return nil, err
 		}
@@ -122,11 +160,19 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 	req := &request{
 		h: h,
 	}
-	// TODO: now we don't know the type of request argv
-	// day 1, just suppose it's string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		err = fmt.Errorf("rpc: read body error: %w", err)
+	req.svc, req.mtype, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+	// make sure that argvi is a pointer, ReadBody need a pointer as parameter
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr { // 不是指针类型时，取地址
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
+		err = fmt.Errorf("rpc server: read body error: %w", err)
 	}
 	return req, err
 }
@@ -134,10 +180,11 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 // handleRequest 处理请求
 func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+	if err := req.svc.call(req.mtype, req.argv, req.replyv); err != nil {
+		req.h.Error = err.Error()
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
 	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 
@@ -150,4 +197,113 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	if err := cc.Write(h, body); err != nil {
 		log.Println("rpc server: write response error:", err)
 	}
+}
+
+/*
+对 net/rpc 而言，一个函数需要能够被远程调用，需要满足如下五个条件：
+
+the method’s type is exported.
+the method is exported.
+the method has two arguments, both exported (or builtin) types.
+the method’s second argument is a pointer.
+the method has return type error.
+更直观一些：
+func (t *T) MethodName(argType T1, replyType *T2) error
+*/
+// methodType 包含了表示一个遵循上述RPC方法签名的完整信息
+type methodType struct {
+	method    reflect.Method // 方法本身
+	ArgType   reflect.Type   // 第一个参数的类型
+	ReplyType reflect.Type   // 第二个参数的类型
+	numCalls  atomic.Uint64  // 统计方法调用的次数
+}
+
+func (m *methodType) NumCalls() uint64 {
+	return m.numCalls.Load()
+}
+
+// 创建一个ArgType类型的变量（空值）
+func (m *methodType) newArgv() (argv reflect.Value) {
+	// arg may be a pointer type, or a value type
+	if m.ArgType.Kind() == reflect.Ptr {
+		argv = reflect.New(m.ArgType.Elem()) // 指针类型取指针
+	} else {
+		argv = reflect.New(m.ArgType).Elem() // 值类型取值
+	}
+	return
+}
+
+// 创建一个ReplyType类型的变量（空值）
+func (m *methodType) newReplyv() (replyv reflect.Value) {
+	// reply must be a pointer type
+	replyv = reflect.New(m.ReplyType.Elem())
+	// 取指针指向的值类型
+	switch m.ReplyType.Elem().Kind() { // 初始化引用类型
+	case reflect.Map:
+		replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
+	case reflect.Slice:
+		replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
+	case reflect.Chan:
+		panic("rpc server: can not use chan type for reply")
+	}
+	return
+}
+
+// service 表示一个RPC服务
+type service struct {
+	name    string                 // 反射出的结构体名称
+	typ     reflect.Type           // 反射出的结构体类型
+	rcvr    reflect.Value          // 反射出的结构体实例本身（在调用实例方法时，需要实例本身作为第0个参数，即函数的receiver）
+	methods map[string]*methodType // RPC方法表
+}
+
+func newService(rcvr interface{}) *service {
+	s := new(service)
+	s.rcvr = reflect.ValueOf(rcvr)
+	s.name = reflect.Indirect(s.rcvr).Type().Name() // rcvr可能是一个指针，通过Indirect可以返回它指向的对象的类型。不然的话，它的type就是reflect.Ptr。所以不直接用s.typ.Name()
+	s.typ = reflect.TypeOf(rcvr)
+	if !ast.IsExported(s.name) {
+		log.Fatalf("rpc server: %s is not a valid service name", s.name)
+	}
+	s.registerMethods()
+	return s
+}
+
+// registerMethods 过滤出了符合签名规则的方法
+func (s *service) registerMethods() {
+	isExportedOrBuiltinType := func(t reflect.Type) bool {
+		return ast.IsExported(t.Name()) || t.PkgPath() == ""
+	}
+	s.methods = make(map[string]*methodType)
+	for i := range s.typ.NumMethod() {
+		method := s.typ.Method(i)
+		mType := method.Type
+		if mType.NumIn() != 3 || mType.NumOut() != 1 {
+			continue
+		}
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+		argType, replyType := mType.In(1), mType.In(2)
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
+			continue
+		}
+		s.methods[method.Name] = &methodType{
+			method:    method,
+			ArgType:   argType,
+			ReplyType: replyType,
+		}
+		log.Printf("rpc server: register %s.%s\n", s.name, method.Name)
+	}
+}
+
+// call 通过反射结构调用方法
+func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
+	m.numCalls.Add(1)
+	fn := m.method.Func
+	retVals := fn.Call([]reflect.Value{s.rcvr, argv, replyv})
+	if errInter := retVals[0].Interface(); errInter != nil {
+		return errInter.(error)
+	}
+	return nil
 }

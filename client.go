@@ -11,18 +11,6 @@ import (
 	"sync"
 )
 
-/*
-对 net/rpc 而言，一个函数需要能够被远程调用，需要满足如下五个条件：
-
-the method’s type is exported.
-the method is exported.
-the method has two arguments, both exported (or builtin) types.
-the method’s second argument is a pointer.
-the method has return type error.
-更直观一些：
-func (t *T) MethodName(argType T1, replyType *T2) error
-*/
-
 // Call 表示一个正在进行的RPC调用的所需信息
 type Call struct {
 	Seq           uint64      // sequence number chosen by client（用来区分一个客户端发来的不同请求）
@@ -126,8 +114,8 @@ func (c *Client) IsAvailable() bool {
 	return !c.shutdown && !c.closed
 }
 
-// registerCall 将参数 call 添加到 client.pendingCalls 中，并更新 client.seq
-func (c *Client) registerCall(call *Call) (uint64, error) {
+// pendCall 将参数 call 添加到 client.pendingCalls 中，并更新 client.seq
+func (c *Client) pendCall(call *Call) (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.shutdown {
@@ -139,7 +127,7 @@ func (c *Client) registerCall(call *Call) (uint64, error) {
 	return call.Seq, nil
 }
 
-// removeCall 根据 seq，从 client.pendingCalls 中移除对应的 call
+// removeCall 根据 seq 从 client.pendingCalls 中移除对应的 call
 func (c *Client) removeCall(seq uint64) *Call {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -207,8 +195,8 @@ func (c *Client) send(call *Call) {
 	c.sending.Lock()
 	defer c.sending.Unlock()
 
-	// register this call
-	seq, err := c.registerCall(call)
+	// pend this call
+	seq, err := c.pendCall(call)
 	if err != nil {
 		c.handleCallError(call, err)
 		return
