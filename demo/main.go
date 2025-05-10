@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"geerpc"
 	"log"
 	"net"
@@ -18,6 +17,15 @@ import (
 6. 执行结束后reply传给了call.Reply, 绑定到主函数中的reply string，打印出来即为结果。
 */
 
+type FooService int
+
+type Args struct{ Num1, Num2 int }
+
+func (f FooService) Sum(args Args, reply *int) error {
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
 // 为了确保server先启动完成，所以这里addr用无缓冲的chan
 func startServer(addr chan string) {
 	// pick a free port
@@ -28,6 +36,9 @@ func startServer(addr chan string) {
 	log.Printf("start rpc server on %s", lis.Addr())
 	addr <- lis.Addr().String()
 	server := geerpc.NewServer()
+	if err := server.Register(new(FooService)); err != nil {
+		log.Printf("register error: %v", err)
+	}
 	server.Accept(lis)
 }
 
@@ -47,13 +58,12 @@ func main() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			args := fmt.Sprintf("geerpc req %d", i)
-			var reply string
-			// reply是interface{}，所以这里要传指针
-			if err := client.Call("Foo.Sum", args, &reply); err != nil {
-				log.Fatal("call Foo.Sum error:", err)
+			args := &Args{Num1: i, Num2: i * i}
+			var reply int
+			if err := client.Call("FooService.Sum", args, &reply); err != nil {
+				log.Fatal("call FooService.Sum error:", err)
 			}
-			log.Printf("req %d, reply: %s", i, reply)
+			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
 		}(i)
 	}
 	wg.Wait()
