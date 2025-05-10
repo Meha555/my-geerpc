@@ -80,7 +80,7 @@ var invalidRequest = struct{}{}
 
 // serveCodec 解码多个Header+Body对
 func (s *Server) serveCodec(cc codec.Codec) {
-	sending := new(sync.Mutex)
+	sending := new(sync.Mutex) // 为了保证请求的有序发送
 	wg := new(sync.WaitGroup)  // wait until all request are handled
 	// 可能有多个Header+Body对
 	for {
