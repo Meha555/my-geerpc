@@ -1,6 +1,7 @@
 package geerpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call 表示一个正在进行的RPC调用的所需信息
@@ -67,13 +69,25 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	return c
 }
 
-// Dial connects to an RPC server at the specified network address
-func Dial(network, address string, opts ...*Option) (cli *Client, err error) {
+type result struct {
+	cli *Client
+	err error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (*Client, error)
+
+func dialTimeout(fn newClientFunc, network, address string, opts ...*Option) (cli *Client, err error) {
 	parseOptions := func(opts ...*Option) (*Option, error) {
 		if len(opts) == 0 || opts[0] == nil {
 			return DefaultOption, nil
 		} else if len(opts) > 1 {
 			return nil, errors.New("number of options is more than 1")
+		}
+		if opts[0].MagicNum == 0 {
+			opts[0].MagicNum = DefaultOption.MagicNum
+		}
+		if opts[0].CodecFormat == "" {
+			opts[0].CodecFormat = DefaultOption.CodecFormat
 		}
 		return opts[0], nil
 	}
@@ -81,7 +95,7 @@ func Dial(network, address string, opts ...*Option) (cli *Client, err error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +105,28 @@ func Dial(network, address string, opts ...*Option) (cli *Client, err error) {
 			conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	resCh := make(chan result, 1)
+	go func() {
+		// 创建客户端
+		cli, err := fn(conn, opt)
+		resCh <- result{cli: cli, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		res := <-resCh
+		return res.cli, res.err
+	}
+	// 检查超时
+	select {
+	case res := <-resCh:
+		return res.cli, res.err
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	}
+}
+
+// Dial connects to an RPC server at the specified network address
+func Dial(network, address string, opts ...*Option) (cli *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 var ErrClientClosed = errors.New("rpc client closed")
@@ -242,10 +277,16 @@ func (c *Client) Go(serviceMethod string, args, reply interface{}, done chan *Ca
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
 // 是对 Go 的封装，阻塞 call.Done，等待响应返回，是一个同步接口。
-func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
+func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
 	// 由于这里是同步接口，所以done的缓冲大小只需为1即可
-	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+	call := c.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done(): // 超时了
+		c.removeCall(call.Seq)
+		return fmt.Errorf("rpc client: call failed: %w", ctx.Err())
+	case <-call.Done:
+		return call.Error
+	}
 }
 
 var _ io.Closer = (*Client)(nil)
