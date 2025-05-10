@@ -1,6 +1,7 @@
 package geerpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,7 +41,7 @@ type Client struct {
 	header       codec.Header     // 每个请求的消息头，只在请求发送时才需要，而请求发送是互斥的，因此每个客户端只需要一个，声明在 Client 结构体中可以复用。
 	mu           sync.RWMutex     // protect following
 	seq          uint64           // 给发出的请求编号，每个请求拥有唯一的编号。
-	pendingCalls map[uint64]*Call // 存储未处理完的请求，键是编号，值是 Call 实例
+	pendingCalls map[uint64]*Call // 存储未处理完的请求，键是编号，值是 Call 实例。因为实际上是允许同一个客户端在上一次RPC没有完成时就发起下一次RPC，因此需要一个哈希表来存储哪次请求的调用信息和结果
 	closed       bool             // user has called Close
 	shutdown     bool             // server has told us to stop
 }
@@ -286,6 +289,47 @@ func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply int
 		return fmt.Errorf("rpc client: call failed: %w", ctx.Err())
 	case <-call.Done:
 		return call.Error
+	}
+}
+
+// NewHTTPClient new a Client instance via HTTP as transport protocol
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	// 向服务端发送 HTTP CONNECT 请求
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	// Require successful HTTP response
+	// before switching to RPC protocol.
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+// DialHTTP connects to an HTTP RPC server at the specified network address
+// listening on the default HTTP RPC path.
+func DialHTTP(address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, "tcp", address, opts...)
+}
+
+// XDial calls different functions to connect to a RPC server according the first parameter rpcAddr.
+// rpcAddr is a general format (protocol@addr) to represent a rpc server
+// eg, http://10.0.0.1:7001, tcp://10.0.0.1:9999, unix:///tmp/geerpc.sock
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "://")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol://addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP(addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
 	}
 }
 

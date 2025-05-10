@@ -3,6 +3,8 @@ package geerpc
 import (
 	"context"
 	"net"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,12 +17,12 @@ func (b Bar) Timeout(argv int, reply *int) error {
 	return nil
 }
 
-func startServer(addr chan string) {
+func startServer(network, address string, addrCh chan string) {
 	server := NewServer()
 	server.Register(new(Bar))
 	// pick a free port
-	l, _ := net.Listen("tcp", ":0")
-	addr <- l.Addr().String()
+	l, _ := net.Listen(network, address)
+	addrCh <- l.Addr().String()
 	server.Accept(l)
 }
 
@@ -48,7 +50,7 @@ func TestClient_dialTimeout(t *testing.T) {
 func TestClient_Call(t *testing.T) {
 	t.Parallel()
 	addrCh := make(chan string)
-	go startServer(addrCh)
+	go startServer("tcp", ":0", addrCh)
 	addr := <-addrCh
 	time.Sleep(time.Second)
 	t.Run("client timeout", func(t *testing.T) {
@@ -69,4 +71,18 @@ func TestClient_Call(t *testing.T) {
 		err := client.Call(context.Background(), "Bar.Timeout", 1, &reply)
 		_assert(err != nil && strings.Contains(err.Error(), "handle timeout"), "expect a timeout error")
 	})
+}
+
+func TestXDial(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		addrCh := make(chan string)
+		go func() {
+			os.Remove("/tmp/geerpc.sock")
+			startServer("unix", "/tmp/geerpc.sock", addrCh)
+		}()
+		addr := <-addrCh
+		_, err := XDial("unix://" + addr)
+		_assert(err == nil, "failed to connect unix socket")
+		os.Remove("/tmp/geerpc.sock")
+	}
 }

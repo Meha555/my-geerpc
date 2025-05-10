@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -99,7 +100,7 @@ func (s *Server) Accept(lis net.Listener) {
 // ServeConn 解码连接中的消息，确定消息CodecFormat，然后剩下的处理交给serveCodec
 func (s *Server) ServeConn(conn net.Conn) {
 	defer conn.Close()
-
+	// 握手阶段
 	// 读取Option（客户端只需要在第一次通讯时发送自己的魔数和编码格式，因此服务端也只需要读取1次）
 	var opt Option
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
@@ -111,7 +112,7 @@ func (s *Server) ServeConn(conn net.Conn) {
 		log.Printf("rpc server: invalid magic number %x", opt.MagicNum)
 		return
 	}
-
+	// 正式通信阶段
 	codecFn := codec.NewCodecFuncMap[opt.CodecFormat]
 	s.serveCodec(codecFn(conn), &opt)
 }
@@ -123,7 +124,7 @@ var invalidRequest = struct{}{}
 func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex) // 为了保证请求的有序发送
 	wg := new(sync.WaitGroup)  // wait until all request are handled
-	// 可能有多个Header+Body对
+	// 在一次长链接中，允许接收多个请求，而每个请求都是一个Header+Body对，因此这里使用for循环来处理每个请求，直到发生错误/连接断开
 	for {
 		// 解码请求数据
 		req, err := s.readRequest(cc)
@@ -215,6 +216,7 @@ func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex
 // sendResponse 发送响应
 // golang里文件描述符(FD)的写入已经是 线程安全 的了，因此单纯的写入fd无需加锁。
 // 但是这里是先写入用户缓冲区buf，而这个写入不是线程安全的，所以需要sending这把锁来保护。
+// TODO 由于写入bufio的用户缓冲区速度很快，所以这里应该可以用自旋锁（不知道golang的自旋锁效率是否高于互斥锁）
 func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
@@ -330,4 +332,34 @@ func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
 		return errInter.(error)
 	}
 	return nil
+}
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_geeprc_"
+	defaultDebugPath = "/debug/geerpc"
+)
+
+// ServeHTTP implements an http.Handler that answers RPC requests.
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		http.Error(w, "method must CONNECT", http.StatusMethodNotAllowed)
+		return
+	}
+	// 获取其TCP套接字，从而劫持这个连接，使得之后都是基于TCP的RPC通信
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, fmt.Sprintf("HTTP/1.0 %s\n\n", connected))
+	s.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages on rpcPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement.
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+	http.Handle(defaultDebugPath, debugHTTP{s})
+	log.Println("rpc server debug path:", defaultDebugPath)
 }
