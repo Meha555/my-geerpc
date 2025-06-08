@@ -142,7 +142,6 @@ func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
-	cc.Close()
 }
 
 // readRequest 读取请求
