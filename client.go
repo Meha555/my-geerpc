@@ -225,7 +225,7 @@ func (c *Client) receive() {
 	}
 	// error occurs, so terminateCalls pending calls
 	c.terminateCalls(err)
-	log.Fatalf("rpc client: codec error: %v", err)
+	log.Printf("rpc client: codec error: %v", err)
 }
 
 func (c *Client) send(call *Call) {
