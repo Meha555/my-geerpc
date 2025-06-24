@@ -24,6 +24,7 @@ type Call struct {
 	Reply         interface{} // reply from the function
 	Error         error       // if error occurs, it will be set
 	Done          chan *Call  // Strobes when call is complete
+	canceled      bool        // 是否被取消
 }
 
 func (c *Call) done() {
@@ -174,8 +175,8 @@ func (c *Client) removeCall(seq uint64) *Call {
 	return call
 }
 
-// terminateCalls 服务端或客户端发生错误时调用，将 shutdown 设置为 true，且将错误信息通知所有 pending 状态的 call
-func (c *Client) terminateCalls(err error) {
+// terminate 服务端或客户端发生错误时调用，将 shutdown 设置为 true，且将错误信息通知所有 pending 状态的 call
+func (c *Client) terminate(err error) {
 	// 加sending锁是为了保证此时不会有新的请求被发送（因为会修改shutdown和注册到pendingCalls）
 	c.sending.Lock()
 	defer c.sending.Unlock()
@@ -205,7 +206,7 @@ func (c *Client) receive() {
 		switch {
 		// call不存在
 		case call == nil:
-			// it usually means that Write partially failed and call was already removed.
+			// it usually means that Write partially failed and call was already removed.（可能是超时了）
 			// 读掉这次的call数据
 			err = c.cc.ReadBody(nil)
 		// 服务端出错
@@ -224,7 +225,7 @@ func (c *Client) receive() {
 		}
 	}
 	// error occurs, so terminateCalls pending calls
-	c.terminateCalls(err)
+	c.terminate(err)
 	log.Printf("rpc client: codec error: %v", err)
 }
 
@@ -245,6 +246,10 @@ func (c *Client) send(call *Call) {
 	c.header.Seq = seq
 	c.header.Error = ""
 
+	if call.canceled {
+		log.Printf("rpc client: call %s:%d canceled", call.ServiceMethod, call.Seq)
+		return
+	}
 	// encode and send request
 	if err := c.cc.Write(&c.header, call.Args); err != nil {
 		call := c.removeCall(seq)
@@ -273,9 +278,20 @@ func (c *Client) Go(serviceMethod string, args, reply interface{}, done chan *Ca
 		Args:          args,
 		Reply:         reply,
 		Done:          done,
+		canceled:      false,
 	}
 	go c.send(call)
 	return call
+}
+
+// Cancel 取消一个异步RPC调用，和 Go 配合使用。
+// 不保证调用一定取消，可能已经被服务实例执行完了。
+func (c *Client) Cancel(call *Call) {
+	if call == nil {
+		return
+	}
+	call.canceled = true
+	c.removeCall(call.Seq)
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
@@ -295,12 +311,12 @@ func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply int
 // NewHTTPClient new a Client instance via HTTP as transport protocol
 func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
 	// 向服务端发送 HTTP CONNECT 请求
-	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", kDefaultRPCPath))
 
 	// Require successful HTTP response
 	// before switching to RPC protocol.
 	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
-	if err == nil && resp.Status == connected {
+	if err == nil && resp.Status == kConnected {
 		return NewClient(conn, opt)
 	}
 	if err == nil {

@@ -35,16 +35,16 @@ var (
 	ErrNoAvailableServer = errors.New("no available server")
 )
 
-// MultiServersDiscovery 是一个不需要注册中心，服务列表由手工维护的Discovery实现
-type MultiServerDiscovery struct {
+// InMemoryDiscovery 是一个不需要注册中心，服务列表由手工维护的Discovery实现
+type InMemoryDiscovery struct {
 	r       *rand.Rand
 	servers []string // 服务列表
 	mu      sync.RWMutex
 	index   int // 记录 Round Robin 算法已经轮询到的位置
 }
 
-func NewMultiServerDiscovery(servers []string) *MultiServerDiscovery {
-	d := &MultiServerDiscovery{
+func NewInMemoryDiscovery(servers []string) *InMemoryDiscovery {
+	d := &InMemoryDiscovery{
 		r:       rand.New(rand.NewSource(time.Now().UnixNano())), // 使用时间戳设定随机数种子，避免每次产生相同的随机数序列
 		servers: servers,
 	}
@@ -52,20 +52,22 @@ func NewMultiServerDiscovery(servers []string) *MultiServerDiscovery {
 	return d
 }
 
-func (d *MultiServerDiscovery) Refresh() error {
+func (d *InMemoryDiscovery) Refresh() error {
 	return nil
 }
 
-func (d *MultiServerDiscovery) Update(servers []string) error {
+func (d *InMemoryDiscovery) Update(servers []string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.servers = servers
 	return nil
 }
 
-func (d *MultiServerDiscovery) Select(mode SelectMode) (string, error) {
+// Select 在每次选择时都会重新计算，从而实现了负载均衡
+func (d *InMemoryDiscovery) Select(mode SelectMode) (string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	// n需要每次临时求，因为服务实例列表可能发生变化
 	n := len(d.servers)
 	if n == 0 {
 		return "", ErrNoAvailableServer
@@ -86,10 +88,10 @@ func (d *MultiServerDiscovery) Select(mode SelectMode) (string, error) {
 	}
 }
 
-func (d *MultiServerDiscovery) SelectAll() ([]string, error) {
+func (d *InMemoryDiscovery) SelectAll() ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	// return a copy of d.servers
+	// 切片本身是引用，而这里维护的servers会变化，因此这里应当返回一个servers的拷贝副本
 	servers := make([]string, len(d.servers))
 	copy(servers, d.servers)
 	return servers, nil

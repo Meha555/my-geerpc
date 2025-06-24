@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"geerpc"
+	"geerpc/registry"
 	"geerpc/xclient"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -28,18 +30,30 @@ func (f FooService) Sleep(args Args, reply *int) error {
 	return nil
 }
 
-func startServer(addrCh chan string) {
+func startServer(serverAddrCh chan string) {
 	lis, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	log.Printf("start rpc server on %s", lis.Addr())
-	addrCh <- lis.Addr().String()
+	serverAddrCh <- lis.Addr().String()
 	server := geerpc.NewServer()
 	if err := server.Register(new(FooService)); err != nil {
 		log.Printf("register error: %v", err)
 	}
 	server.Accept(lis)
+}
+
+func startRegistry() string {
+	lis, err := net.Listen("tcp", ":9999")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+	log.Printf("start rpc registry on %s", lis.Addr())
+	reg := registry.NewGeeRegistry(0)
+	reg.HandleHTTP()
+	go http.Serve(lis, nil)
+	return fmt.Sprintf("http://%s", lis.Addr().String())
 }
 
 func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, args *Args) {
@@ -92,16 +106,22 @@ func broadcast(d xclient.Discovery, mode xclient.SelectMode) {
 }
 
 func main() {
+	registryUrl := startRegistry()
 	addrCh1 := make(chan string)
 	go startServer(addrCh1)
 	addrCh2 := make(chan string)
 	go startServer(addrCh2)
 
-	var addrs []string
-	addrs = append(addrs, fmt.Sprintf("tcp://%s", <-addrCh1))
-	addrs = append(addrs, fmt.Sprintf("tcp://%s", <-addrCh2))
+	// var addrs []string
+	// addrs = append(addrs, fmt.Sprintf("tcp://%s", <-addrCh1))
+	// addrs = append(addrs, fmt.Sprintf("tcp://%s", <-addrCh2))
+	// d := xclient.NewInMemoryDiscovery(addrs)
 
-	d := xclient.NewMultiServerDiscovery(addrs)
+	// 发起心跳，会自动将服务注册到注册中心
+	go registry.Heartbeat(registryUrl, fmt.Sprintf("tcp://%s", <-addrCh1), 0)
+	go registry.Heartbeat(registryUrl, fmt.Sprintf("tcp://%s", <-addrCh2), 0)
+
+	d := xclient.NewGeeDiscovery(registryUrl, 0)
 	call(d, xclient.RandomSelect)
 	broadcast(d, xclient.RandomSelect)
 	select {}

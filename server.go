@@ -334,9 +334,9 @@ func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
 }
 
 const (
-	connected        = "200 Connected to Gee RPC"
-	defaultRPCPath   = "/_geeprc_"
-	defaultDebugPath = "/debug/geerpc"
+	kConnected       = "200 Connected to Gee RPC"
+	kDefaultRPCPath  = "/geeprc"
+	kDefaultDebugPath = "/debug/geerpc"
 )
 
 // ServeHTTP implements an http.Handler that answers RPC requests.
@@ -351,14 +351,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
 		return
 	}
-	_, _ = io.WriteString(conn, fmt.Sprintf("HTTP/1.0 %s\n\n", connected))
+	_, _ = io.WriteString(conn, fmt.Sprintf("HTTP/1.0 %s\n\n", kConnected))
 	s.ServeConn(conn)
 }
 
 // HandleHTTP registers an HTTP handler for RPC messages on rpcPath.
 // It is still necessary to invoke http.Serve(), typically in a go statement.
 func (s *Server) HandleHTTP() {
-	http.Handle(defaultRPCPath, s)
-	http.Handle(defaultDebugPath, debugHTTP{s})
-	log.Println("rpc server debug path:", defaultDebugPath)
+	http.Handle(kDefaultRPCPath, s)
+	http.Handle(kDefaultDebugPath, debugHTTP{s})
+	log.Println("rpc server debug path:", kDefaultDebugPath)
 }

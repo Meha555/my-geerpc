@@ -14,6 +14,7 @@ type XClient struct {
 	mode    SelectMode
 	opt     *geerpc.Option
 	mu      sync.Mutex
+	// 为了尽量地复用已经创建好的 Socket 连接，使用 clients 保存创建成功的 Client 实例
 	clients map[string]*geerpc.Client // 缓存用于和服务实例通信的客户端
 }
 
@@ -47,12 +48,12 @@ func (xc *XClient) Call(ctx context.Context, serviceMethod string, args, reply i
 
 func (xc *XClient) call(serverAddr string, ctx context.Context, serviceMethod string, args, reply interface{}) error {
 	// 1. 建立连接
-	if client, err := xc.dial(serverAddr); err != nil {
+	client, err := xc.dial(serverAddr)
+	if err != nil {
 		return err
-	} else {
-		// 2. 发起调用并等待结果
-		return client.Call(ctx, serviceMethod, args, reply)
 	}
+	// 2. 发起调用并等待结果
+	return client.Call(ctx, serviceMethod, args, reply)
 }
 
 func (xc *XClient) dial(serverAddr string) (*geerpc.Client, error) {
